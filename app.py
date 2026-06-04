@@ -1,5 +1,5 @@
+import base64
 import os
-import statistics
 import requests
 import pandas as pd
 import plotly.express as px
@@ -15,7 +15,9 @@ st.set_page_config(
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-FINDING_API_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
+OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
+MARKETPLACE_INSIGHTS_URL = "https://api.ebay.com/buy/marketplace_insights/v1_beta/item_sales/search"
+MARKETPLACE_INSIGHTS_SCOPE = "https://api.ebay.com/oauth/api_scope/buy.marketplace.insights"
 
 CONDITIONS = {
     "Any condition": None,
@@ -30,96 +32,101 @@ CONDITIONS = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def fetch_sold_items(app_id, keywords, condition_id, exclude_keywords, include_shipping, days, max_pages):
-    """Call eBay Finding API and return parsed item list plus a reference image URL."""
+@st.cache_data(ttl=7000)
+def get_oauth_token(client_id, client_secret):
+    """Fetch an OAuth application token (cached for ~2 hours)."""
+    credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    response = requests.post(
+        OAUTH_URL,
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data=f"grant_type=client_credentials&scope={MARKETPLACE_INSIGHTS_SCOPE}",
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
+def fetch_sold_items(client_id, client_secret, keywords, condition_id, exclude_keywords, days, max_pages):
+    """Call eBay Marketplace Insights API and return parsed sold item list plus a reference image URL."""
+    token = get_oauth_token(client_id, client_secret)
+
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=days)
+
+    start_str = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    filter_parts = [f"lastSoldDate:[{start_str}..{end_str}]"]
+    if condition_id:
+        filter_parts.append(f"conditionIds:{{{condition_id}}}")
 
     all_items = []
     reference_image_url = None
 
-    for page in range(1, max_pages + 1):
+    for page in range(max_pages):
+        offset = page * 100
         params = {
-            "OPERATION-NAME": "findCompletedItems",
-            "SERVICE-VERSION": "1.0.0",
-            "SECURITY-APPNAME": app_id,
-            "RESPONSE-DATA-FORMAT": "JSON",
-            "REST-PAYLOAD": "",
-            "keywords": keywords,
-            "itemFilter(0).name": "SoldItemsOnly",
-            "itemFilter(0).value": "true",
-            "itemFilter(1).name": "EndTimeFrom",
-            "itemFilter(1).value": start_time.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "itemFilter(2).name": "EndTimeTo",
-            "itemFilter(2).value": end_time.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "sortOrder": "EndTimeSoonest",
-            "paginationInput.entriesPerPage": 100,
-            "paginationInput.pageNumber": page,
+            "q": keywords,
+            "limit": 100,
+            "offset": offset,
+            "filter": ",".join(filter_parts),
         }
 
-        fi = 3
-        if condition_id:
-            params[f"itemFilter({fi}).name"] = "Condition"
-            params[f"itemFilter({fi}).value"] = condition_id
-            fi += 1
-
-        response = requests.get(FINDING_API_URL, params=params, timeout=15)
+        response = requests.get(
+            MARKETPLACE_INSIGHTS_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+            },
+            params=params,
+            timeout=15,
+        )
         response.raise_for_status()
         data = response.json()
 
-        result = data["findCompletedItemsResponse"][0]
-        if result["ack"][0] != "Success":
-            err = result.get("errorMessage", [{}])[0].get("error", [{}])[0].get("message", ["Unknown"])[0]
-            raise ValueError(f"eBay API error: {err}")
-
-        items = result.get("searchResult", [{}])[0].get("item", [])
+        items = data.get("itemSales", [])
         if not items:
             break
 
         for item in items:
             try:
-                item_price = float(item["sellingStatus"][0]["currentPrice"][0]["__value__"])
-                shipping_price = 0.0
-                shipping_type = item.get("shippingInfo", [{}])[0].get("shippingType", ["Unknown"])[0]
-                shipping_cost_list = item.get("shippingInfo", [{}])[0].get("shippingServiceCost", [])
-                if shipping_cost_list:
-                    shipping_price = float(shipping_cost_list[0]["__value__"])
+                price_info = item.get("price", {})
+                item_price = float(price_info.get("value", 0))
 
-                total_price = item_price + shipping_price if include_shipping else item_price
-
-                title = item["title"][0]
-                # Skip if any exclude keyword appears in title
+                title = item.get("title", "")
                 if exclude_keywords:
-                    skip = any(kw.strip().lower() in title.lower() for kw in exclude_keywords.split(",") if kw.strip())
-                    if skip:
+                    if any(kw.strip().lower() in title.lower() for kw in exclude_keywords.split(",") if kw.strip()):
                         continue
 
-                end_time_str = item["listingInfo"][0]["endTime"][0]
-                sold_date = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
-                condition = item.get("condition", [{}])[0].get("conditionDisplayName", ["Unknown"])[0]
-                url = item["viewItemURL"][0]
+                last_sold_str = item.get("lastSoldDate", "")
+                sold_date = (
+                    datetime.fromisoformat(last_sold_str.replace("Z", "+00:00")).date()
+                    if last_sold_str else None
+                )
 
-                # Grab the first available gallery image as a reference
+                condition = item.get("condition", "Unknown")
+                url = item.get("itemWebUrl", "")
+
                 if reference_image_url is None:
-                    gallery = item.get("galleryURL", [None])[0]
-                    if gallery:
-                        # Replace _s-l140 thumbnail suffix with _s-l500 for a larger image
-                        reference_image_url = gallery.replace("_s-l140", "_s-l500")
+                    image = item.get("image", {})
+                    if image:
+                        reference_image_url = image.get("imageUrl", "")
 
                 all_items.append({
                     "Title": title,
-                    "Item Price": item_price,
-                    "Shipping": shipping_price,
-                    "Total Price": total_price,
+                    "Sale Price": item_price,
                     "Condition": condition,
-                    "Sold Date": sold_date.date(),
+                    "Sold Date": sold_date,
                     "URL": url,
                 })
-            except (KeyError, IndexError, ValueError):
+            except (KeyError, ValueError):
                 continue
 
-        # Stop if fewer than 100 returned (last page)
-        if len(items) < 100:
+        total = data.get("total", 0)
+        if offset + 100 >= total or len(items) < 100:
             break
 
     return pd.DataFrame(all_items), reference_image_url
@@ -141,13 +148,20 @@ with st.sidebar:
     st.markdown("Find sold listing prices on eBay for completed listings.")
     st.divider()
 
-    # Read from Streamlit Cloud secrets first, then env var, then let user type it
-    default_key = st.secrets.get("EBAY_APP_ID", os.environ.get("EBAY_APP_ID", ""))
-    api_key = st.text_input(
-        "eBay App ID",
-        value=default_key,
+    default_client_id = st.secrets.get("EBAY_CLIENT_ID", os.environ.get("EBAY_CLIENT_ID", ""))
+    default_client_secret = st.secrets.get("EBAY_CLIENT_SECRET", os.environ.get("EBAY_CLIENT_SECRET", ""))
+
+    client_id = st.text_input(
+        "eBay App ID (Client ID)",
+        value=default_client_id,
         type="password",
-        help="Get your free App ID at developer.ebay.com",
+        help="Your App ID from developer.ebay.com",
+    )
+    client_secret = st.text_input(
+        "eBay Cert ID (Client Secret)",
+        value=default_client_secret,
+        type="password",
+        help="Your Cert ID from developer.ebay.com → Application Keys",
     )
 
     st.subheader("Search Settings")
@@ -157,7 +171,6 @@ with st.sidebar:
         placeholder="lot, broken, parts",
         help="Listings containing these words will be filtered out",
     )
-    include_shipping = st.toggle("Include shipping in price", value=False)
     max_pages = st.slider("Max result pages (100 per page)", min_value=1, max_value=3, value=1)
 
     TIME_PERIODS = {
@@ -169,7 +182,7 @@ with st.sidebar:
     days = TIME_PERIODS[period_label]
 
     st.divider()
-    st.caption("Free eBay API · 5,000 calls/day limit")
+    st.caption("eBay Marketplace Insights API · Free for registered developers")
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 st.header("eBay Sold Price Checker", divider="gray")
@@ -182,8 +195,8 @@ with col_btn:
 
 # ── Run search ────────────────────────────────────────────────────────────────
 if search_clicked:
-    if not api_key:
-        st.error("Please enter your eBay App ID in the sidebar. Get one free at developer.ebay.com")
+    if not client_id or not client_secret:
+        st.error("Please enter your eBay App ID and Cert ID in the sidebar. Get them at developer.ebay.com → Application Keys.")
         st.stop()
     if not keywords.strip():
         st.warning("Please enter a search term.")
@@ -193,7 +206,19 @@ if search_clicked:
 
     with st.spinner(f"Searching eBay for '{keywords}'..."):
         try:
-            df, reference_image_url = fetch_sold_items(api_key, keywords, condition_id, exclude_kw, include_shipping, days, max_pages)
+            df, reference_image_url = fetch_sold_items(
+                client_id, client_secret, keywords, condition_id, exclude_kw, days, max_pages
+            )
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 403:
+                st.error(
+                    "Access denied (403). Your eBay developer account may not have access to the "
+                    "Marketplace Insights API. Visit developer.ebay.com and ensure your application "
+                    "has the `buy.marketplace.insights` OAuth scope enabled."
+                )
+            else:
+                st.error(f"Error fetching data: {e}")
+            st.stop()
         except Exception as e:
             st.error(f"Error fetching data: {e}")
             st.stop()
@@ -202,7 +227,7 @@ if search_clicked:
         st.warning(f"No sold listings found for **{keywords}** in the past {days} days with the selected filters.")
         st.stop()
 
-    price_col = "Total Price" if include_shipping else "Item Price"
+    price_col = "Sale Price"
     prices = df[price_col]
 
     # Mark outliers
@@ -216,13 +241,12 @@ if search_clicked:
             st.image(reference_image_url, width=120)
         with title_col:
             st.subheader(f"Results: {len(df)} sold listings for \"{keywords}\"")
-            st.caption(f"Period: {period_label}" + (" · Prices include shipping" if include_shipping else ""))
+            st.caption(f"Period: {period_label}")
     else:
         st.subheader(f"Results: {len(df)} sold listings for \"{keywords}\"")
-        st.caption(f"Period: {period_label}" + (" · Prices include shipping" if include_shipping else ""))
+        st.caption(f"Period: {period_label}")
 
     # ── Stats ──────────────────────────────────────────────────────────────────
-
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Mean", f"${prices.mean():.2f}")
     m2.metric("Median", f"${prices.median():.2f}")
@@ -290,10 +314,6 @@ if search_clicked:
     show_outliers = st.toggle("Show outliers in table", value=True)
     display_df = df if show_outliers else df[~df["Outlier"]]
 
-    # Make URL clickable
-    display_df = display_df.copy()
-    display_df["Link"] = display_df["URL"].apply(lambda u: f'<a href="{u}" target="_blank">View</a>')
-
     st.dataframe(
         display_df[["Sold Date", price_col, "Condition", "Outlier", "Title"]].rename(columns={price_col: "Price ($)"}),
         use_container_width=True,
@@ -306,7 +326,7 @@ if search_clicked:
     )
 
     # ── CSV Export ─────────────────────────────────────────────────────────────
-    csv = display_df[["Sold Date", "Item Price", "Shipping", "Total Price", "Condition", "Outlier", "Title", "URL"]].to_csv(index=False)
+    csv = display_df[["Sold Date", "Sale Price", "Condition", "Outlier", "Title", "URL"]].to_csv(index=False)
     st.download_button(
         label="Download CSV",
         data=csv,
@@ -324,6 +344,5 @@ else:
     - Price histogram & box plot
     - Filter by item condition
     - Exclude keywords to clean results
-    - Optional shipping cost inclusion
     - Download results as CSV
     """)
