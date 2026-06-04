@@ -16,8 +16,9 @@ st.set_page_config(
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
+OAUTH_SCOPE = "https://api.ebay.com/oauth/api_scope"
 MARKETPLACE_INSIGHTS_URL = "https://api.ebay.com/buy/marketplace_insights/v1_beta/item_sales/search"
-MARKETPLACE_INSIGHTS_SCOPE = "https://api.ebay.com/oauth/api_scope/buy.marketplace.insights"
+BROWSE_API_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 
 CONDITIONS = {
     "Any condition": None,
@@ -34,7 +35,7 @@ CONDITIONS = {
 
 @st.cache_data(ttl=7000)
 def get_oauth_token(client_id, client_secret):
-    """Fetch an OAuth application token (cached for ~2 hours)."""
+    """Fetch an OAuth application token using the standard scope (cached for ~2 hours)."""
     credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     response = requests.post(
         OAUTH_URL,
@@ -42,24 +43,58 @@ def get_oauth_token(client_id, client_secret):
             "Authorization": f"Basic {credentials}",
             "Content-Type": "application/x-www-form-urlencoded",
         },
-        data=f"grant_type=client_credentials&scope={MARKETPLACE_INSIGHTS_SCOPE}",
+        data=f"grant_type=client_credentials&scope={OAUTH_SCOPE}",
         timeout=15,
     )
     response.raise_for_status()
     return response.json()["access_token"]
 
 
+def _parse_browse_item(item, exclude_keywords):
+    """Parse a single Browse API item summary into a dict, or return None to skip."""
+    price_info = item.get("price", {})
+    item_price = float(price_info.get("value", 0))
+
+    title = item.get("title", "")
+    if exclude_keywords:
+        if any(kw.strip().lower() in title.lower() for kw in exclude_keywords.split(",") if kw.strip()):
+            return None
+
+    end_date_str = item.get("itemEndDate", "")
+    sold_date = (
+        datetime.fromisoformat(end_date_str.replace("Z", "+00:00")).date()
+        if end_date_str else None
+    )
+
+    condition = item.get("condition", "Unknown")
+    url = item.get("itemWebUrl", "")
+    image_url = item.get("image", {}).get("imageUrl", "") or None
+
+    return {
+        "title": title,
+        "price": item_price,
+        "condition": condition,
+        "sold_date": sold_date,
+        "url": url,
+        "image_url": image_url,
+    }
+
+
 def fetch_sold_items(client_id, client_secret, keywords, condition_id, exclude_keywords, days, max_pages):
-    """Call eBay Marketplace Insights API and return parsed sold item list plus a reference image URL."""
+    """
+    Fetch recently sold eBay listings via the Browse API.
+
+    Uses itemEndDate filter to find listings that ended (sold) within the requested
+    time window. Returns a DataFrame and a reference image URL.
+    """
     token = get_oauth_token(client_id, client_secret)
 
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=days)
-
     start_str = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_str = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    filter_parts = [f"lastSoldDate:[{start_str}..{end_str}]"]
+    filter_parts = [f"itemEndDate:[{start_str}..{end_str}]"]
     if condition_id:
         filter_parts.append(f"conditionIds:{{{condition_id}}}")
 
@@ -73,10 +108,11 @@ def fetch_sold_items(client_id, client_secret, keywords, condition_id, exclude_k
             "limit": 100,
             "offset": offset,
             "filter": ",".join(filter_parts),
+            "sort": "endingSoonest",
         }
 
         response = requests.get(
-            MARKETPLACE_INSIGHTS_URL,
+            BROWSE_API_URL,
             headers={
                 "Authorization": f"Bearer {token}",
                 "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
@@ -87,40 +123,23 @@ def fetch_sold_items(client_id, client_secret, keywords, condition_id, exclude_k
         response.raise_for_status()
         data = response.json()
 
-        items = data.get("itemSales", [])
+        items = data.get("itemSummaries", [])
         if not items:
             break
 
         for item in items:
             try:
-                price_info = item.get("price", {})
-                item_price = float(price_info.get("value", 0))
-
-                title = item.get("title", "")
-                if exclude_keywords:
-                    if any(kw.strip().lower() in title.lower() for kw in exclude_keywords.split(",") if kw.strip()):
-                        continue
-
-                last_sold_str = item.get("lastSoldDate", "")
-                sold_date = (
-                    datetime.fromisoformat(last_sold_str.replace("Z", "+00:00")).date()
-                    if last_sold_str else None
-                )
-
-                condition = item.get("condition", "Unknown")
-                url = item.get("itemWebUrl", "")
-
-                if reference_image_url is None:
-                    image = item.get("image", {})
-                    if image:
-                        reference_image_url = image.get("imageUrl", "")
-
+                parsed = _parse_browse_item(item, exclude_keywords)
+                if parsed is None:
+                    continue
+                if reference_image_url is None and parsed["image_url"]:
+                    reference_image_url = parsed["image_url"]
                 all_items.append({
-                    "Title": title,
-                    "Sale Price": item_price,
-                    "Condition": condition,
-                    "Sold Date": sold_date,
-                    "URL": url,
+                    "Title": parsed["title"],
+                    "Sale Price": parsed["price"],
+                    "Condition": parsed["condition"],
+                    "Sold Date": parsed["sold_date"],
+                    "URL": parsed["url"],
                 })
             except (KeyError, ValueError):
                 continue
@@ -182,7 +201,7 @@ with st.sidebar:
     days = TIME_PERIODS[period_label]
 
     st.divider()
-    st.caption("eBay Marketplace Insights API · Free for registered developers")
+    st.caption("eBay Browse API · Free for registered developers")
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 st.header("eBay Sold Price Checker", divider="gray")
@@ -210,12 +229,11 @@ if search_clicked:
                 client_id, client_secret, keywords, condition_id, exclude_kw, days, max_pages
             )
         except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 403:
-                st.error(
-                    "Access denied (403). Your eBay developer account may not have access to the "
-                    "Marketplace Insights API. Visit developer.ebay.com and ensure your application "
-                    "has the `buy.marketplace.insights` OAuth scope enabled."
-                )
+            status = e.response.status_code if e.response is not None else None
+            if status == 401:
+                st.error("Invalid credentials (401). Check that your App ID and Cert ID are correct and belong to a Production app on developer.ebay.com.")
+            elif status == 403:
+                st.error("Access denied (403). Ensure your eBay app has the Browse API enabled on developer.ebay.com.")
             else:
                 st.error(f"Error fetching data: {e}")
             st.stop()
